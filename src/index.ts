@@ -32,18 +32,67 @@ export interface WorkflowStep {
   inputMapping: Record<string, any>;
   condition?: {
     variable: string;
-    operator: "equals" | "contains" | "greaterThan";
+    operator: "equals" | "contains" | "greaterThan" | "lessThan";
     value: any;
   };
   retryConfig?: {
     maxRetries: number;
     delayMs: number;
   };
+  parallelWith?: string[]; // IDs of steps to run in parallel with this one
 }
 
 export interface WorkflowDefinition {
   name: string;
+  description?: string;
   steps: WorkflowStep[];
+}
+
+// --- Validation Utils ---
+
+class WorkflowValidator {
+  static validate(workflow: WorkflowDefinition) {
+    const stepIds = new Set(workflow.steps.map(s => s.id));
+    if (stepIds.size !== workflow.steps.length) {
+      throw new Error("Duplicate step IDs found in workflow.");
+    }
+
+    // Check for circular dependencies
+    const adj = new Map<string, string[]>();
+    for (const step of workflow.steps) {
+      const deps: string[] = [];
+      for (const mapping of Object.values(step.inputMapping)) {
+        if (typeof mapping === "object" && mapping.fromStep) {
+          deps.push(mapping.fromStep);
+        }
+      }
+      adj.set(step.id, deps);
+    }
+
+    const visited = new Set<string>();
+    const recStack = new Set<string>();
+
+    const hasCycle = (v: string): boolean => {
+      if (recStack.has(v)) return true;
+      if (visited.has(v)) return false;
+
+      visited.add(v);
+      recStack.add(v);
+
+      for (const neighbor of (adj.get(v) || [])) {
+        if (hasCycle(neighbor)) return true;
+      }
+
+      recStack.delete(v);
+      return false;
+    };
+
+    for (const step of workflow.steps) {
+      if (hasCycle(step.id)) {
+        throw new Error(`Circular dependency detected involving step: ${step.id}`);
+      }
+    }
+  }
 }
 
 // --- Skill Registry ---
@@ -109,6 +158,8 @@ class ExecutionEngine {
   }
 
   async executeWorkflow(workflow: WorkflowDefinition, initialVariables: Record<string, any> = {}) {
+    WorkflowValidator.validate(workflow);
+    
     const workflowId = uuidv4();
     const context: ExecutionContext = {
       workflowId,
@@ -117,67 +168,93 @@ class ExecutionEngine {
     };
 
     const stepResults: Record<string, any> = {};
+    const executedSteps = new Set<string>();
+
     context.logger(`Starting workflow: ${workflow.name}`);
 
     for (const step of workflow.steps) {
-      // Check condition if present
-      if (step.condition) {
-        const val = context.variables[step.condition.variable];
-        let met = false;
-        switch (step.condition.operator) {
-          case "equals": met = val === step.condition.value; break;
-          case "contains": met = String(val).includes(step.condition.value); break;
-          case "greaterThan": met = val > step.condition.value; break;
-        }
-        if (!met) {
-          context.logger(`Skipping step ${step.id} due to condition.`);
-          continue;
-        }
-      }
+      if (executedSteps.has(step.id)) continue;
 
-      const skill = this.registry.getSkill(step.skillName);
-      context.logger(`Executing step: ${step.id} (${step.skillName})`);
-
-      const input = this.resolveInputs(step.inputMapping, context.variables, stepResults);
-      const validatedInput = skill.inputSchema.parse(input);
-
-      let lastError: any;
-      let success = false;
-      const retries = step.retryConfig?.maxRetries || 0;
-
-      for (let attempt = 0; attempt <= retries; attempt++) {
-        try {
-          if (attempt > 0) context.logger(`Retry attempt ${attempt} for step ${step.id}`);
-          
-          const result = await skill.execute(validatedInput, context);
-          const validatedOutput = skill.outputSchema.parse(result);
-          
-          stepResults[step.id] = validatedOutput;
-          // Merge results into global variables for convenience
-          Object.assign(context.variables, validatedOutput);
-          
-          success = true;
-          break;
-        } catch (error) {
-          lastError = error;
-          if (step.retryConfig?.delayMs) {
-            await new Promise(r => setTimeout(r, step.retryConfig!.delayMs));
+      // Handle parallel execution
+      if (step.parallelWith && step.parallelWith.length > 0) {
+        const parallelSteps = [step, ...workflow.steps.filter(s => step.parallelWith!.includes(s.id))];
+        context.logger(`Running ${parallelSteps.length} steps in parallel: ${parallelSteps.map(s => s.id).join(', ')}`);
+        
+        const promises = parallelSteps.map(s => this.executeStep(s, context, stepResults));
+        const results = await Promise.all(promises);
+        
+        results.forEach((res, i) => {
+          if (res) {
+            stepResults[parallelSteps[i].id] = res;
+            executedSteps.add(parallelSteps[i].id);
           }
-        }
+        });
+        continue;
       }
 
-      if (!success) {
-        context.logger(`Step ${step.id} failed after ${retries} retries: ${lastError}`);
-        this.persister.saveState(workflowId, { status: "failed", lastStep: step.id, error: String(lastError) });
-        throw lastError;
+      const result = await this.executeStep(step, context, stepResults);
+      if (result) {
+        stepResults[step.id] = result;
+        executedSteps.add(step.id);
       }
-
+      
       this.persister.saveState(workflowId, { status: "in-progress", currentStep: step.id, stepResults });
     }
 
     context.logger(`Workflow ${workflow.name} completed.`);
     this.persister.saveState(workflowId, { status: "completed", stepResults });
     return stepResults;
+  }
+
+  private async executeStep(step: WorkflowStep, context: ExecutionContext, stepResults: Record<string, any>): Promise<any | null> {
+    // Check condition if present
+    if (step.condition) {
+      const val = context.variables[step.condition.variable];
+      let met = false;
+      switch (step.condition.operator) {
+        case "equals": met = val === step.condition.value; break;
+        case "contains": met = String(val).includes(step.condition.value); break;
+        case "greaterThan": met = val > step.condition.value; break;
+        case "lessThan": met = val < step.condition.value; break;
+      }
+      if (!met) {
+        context.logger(`Skipping step ${step.id} due to condition.`);
+        return null;
+      }
+    }
+
+    const skill = this.registry.getSkill(step.skillName);
+    context.logger(`Executing step: ${step.id} (${step.skillName})`);
+
+    const input = this.resolveInputs(step.inputMapping, context.variables, stepResults);
+    const validatedInput = skill.inputSchema.parse(input);
+
+    let lastError: any;
+    let success = false;
+    const retries = step.retryConfig?.maxRetries || 0;
+
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        if (attempt > 0) context.logger(`Retry attempt ${attempt} for step ${step.id}`);
+        
+        const result = await skill.execute(validatedInput, context);
+        const validatedOutput = skill.outputSchema.parse(result);
+        
+        // Merge results into global variables for convenience
+        Object.assign(context.variables, validatedOutput);
+        
+        return validatedOutput;
+      } catch (error) {
+        lastError = error;
+        context.logger(`Error in step ${step.id}: ${error}`);
+        if (attempt < retries && step.retryConfig?.delayMs) {
+          await new Promise(r => setTimeout(r, step.retryConfig!.delayMs));
+        }
+      }
+    }
+
+    context.logger(`Step ${step.id} failed after ${retries} retries: ${lastError}`);
+    throw lastError;
   }
 
   private resolveInputs(mapping: Record<string, any>, variables: Record<string, any>, stepResults: Record<string, any>): Record<string, any> {
@@ -260,6 +337,60 @@ registry.register({
   }
 });
 
+registry.register({
+  name: "data-fetcher",
+  description: "Fetches external data (Mock)",
+  inputSchema: z.object({
+    url: z.string().url()
+  }),
+  outputSchema: z.object({
+    data: z.any(),
+    status: z.number()
+  }),
+  execute: async (input) => {
+    return {
+      data: { id: 1, title: "Mock Data", content: "This is some mock content from " + input.url },
+      status: 200
+    };
+  }
+});
+
+registry.register({
+  name: "summarizer",
+  description: "Summarizes long text (Mock)",
+  inputSchema: z.object({
+    text: z.string(),
+    maxLength: z.number().default(100)
+  }),
+  outputSchema: z.object({
+    summary: z.string()
+  }),
+  execute: async (input) => {
+    return {
+      summary: input.text.slice(0, input.maxLength) + "..."
+    };
+  }
+});
+
+registry.register({
+  name: "validator",
+  description: "Validates data against rules (Mock)",
+  inputSchema: z.object({
+    data: z.any(),
+    rules: z.array(z.string())
+  }),
+  outputSchema: z.object({
+    isValid: z.boolean(),
+    errors: z.array(z.string())
+  }),
+  execute: async (input) => {
+    return {
+      isValid: true,
+      errors: []
+    };
+  }
+});
+
 // --- CLI ---
 
 const program = new Command();
@@ -316,6 +447,89 @@ program
 
     try {
       const results = await engine.executeWorkflow(workflow);
+      console.log("\n--- Final Results ---");
+      console.log(JSON.stringify(results, null, 2));
+    } catch (err) {
+      console.error("Workflow execution failed:", err);
+    }
+  });
+
+program
+  .command("run-parallel")
+  .description("Run a parallel workflow example")
+  .action(async () => {
+    const engine = new ExecutionEngine(registry);
+
+    const workflow: WorkflowDefinition = {
+      name: "Parallel Data Processing",
+      steps: [
+        {
+          id: "fetch1",
+          skillName: "data-fetcher",
+          inputMapping: { url: "https://api.source1.com" },
+          parallelWith: ["fetch2"]
+        },
+        {
+          id: "fetch2",
+          skillName: "data-fetcher",
+          inputMapping: { url: "https://api.source2.com" }
+        },
+        {
+          id: "summarize",
+          skillName: "summarizer",
+          inputMapping: {
+            text: { fromStep: "fetch1", path: "data.content" },
+            maxLength: 50
+          }
+        }
+      ]
+    };
+
+    try {
+      const results = await engine.executeWorkflow(workflow);
+      console.log("\n--- Final Results ---");
+      console.log(JSON.stringify(results, null, 2));
+    } catch (err) {
+      console.error("Workflow execution failed:", err);
+    }
+  });
+
+program
+  .command("run-conditional")
+  .description("Run a conditional workflow example")
+  .option("-s, --score <score>", "Initial sentiment score", "0.8")
+  .action(async (options) => {
+    const engine = new ExecutionEngine(registry);
+
+    const workflow: WorkflowDefinition = {
+      name: "Conditional Alerting",
+      steps: [
+        {
+          id: "check",
+          skillName: "validator",
+          inputMapping: {
+            data: { score: parseFloat(options.score) },
+            rules: ["score > 0.5"]
+          }
+        },
+        {
+          id: "notify",
+          skillName: "text-transformer",
+          inputMapping: {
+            text: "High score detected!",
+            mode: "uppercase"
+          },
+          condition: {
+            variable: "score",
+            operator: "greaterThan",
+            value: 0.5
+          }
+        }
+      ]
+    };
+
+    try {
+      const results = await engine.executeWorkflow(workflow, { score: parseFloat(options.score) });
       console.log("\n--- Final Results ---");
       console.log(JSON.stringify(results, null, 2));
     } catch (err) {

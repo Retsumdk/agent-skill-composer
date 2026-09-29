@@ -50,7 +50,7 @@ export interface WorkflowDefinition {
 
 // --- Validation Utils ---
 
-class WorkflowValidator {
+export class WorkflowValidator {
   static validate(workflow: WorkflowDefinition) {
     const stepIds = new Set(workflow.steps.map(s => s.id));
     if (stepIds.size !== workflow.steps.length) {
@@ -97,7 +97,7 @@ class WorkflowValidator {
 
 // --- Skill Registry ---
 
-class SkillRegistry {
+export class SkillRegistry {
   private skills: Map<string, SkillDefinition<any, any>> = new Map();
 
   register(skill: SkillDefinition<any, any>) {
@@ -120,7 +120,7 @@ class SkillRegistry {
 
 // --- Persistence Layer ---
 
-class StatePersister {
+export class StatePersister {
   private storagePath: string;
 
   constructor(storagePath: string = "workflows-state.json") {
@@ -150,7 +150,7 @@ class StatePersister {
 
 // --- Execution Engine ---
 
-class ExecutionEngine {
+export class ExecutionEngine {
   private persister: StatePersister;
 
   constructor(private registry: SkillRegistry) {
@@ -537,4 +537,7 @@ program
     }
   });
 
-program.parse(process.argv);
+if (import.meta.main) {
+  program.parse(process.argv);
+}
+
